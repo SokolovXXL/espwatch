@@ -1,6 +1,8 @@
 {
   "files": [
     "actions.h",
+    "eez-flow.cpp",
+    "eez-flow.h",
     "fonts.h",
     "images.c",
     "images.h",
@@ -12,7 +14,9 @@
     "ui.c",
     "ui.h",
     "ui_font_ethnocentric.c",
-    "ui_image_fone.c",
+    "ui_image_bg.c",
+    "ui_image_cross.c",
+    "ui_image_wifi.c",
     "vars.h"
   ]
 }

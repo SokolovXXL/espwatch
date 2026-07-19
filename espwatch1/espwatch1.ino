@@ -8,8 +8,8 @@
 #include <time.h>
 
 // ---------- НАСТРОЙКИ Wi-Fi ----------
-const char* ssid     = "Xiaomi_0F6D";
-const char* password = "krokodil-11";
+const char* ssid     = "your wifi name";
+const char* password = "your wifi password";
 
 // ---------- ПИНЫ (настройте под свой проект) ----------
 #define Touch_I2C_SDA 18
@@ -190,7 +190,7 @@ bool syncTime() {
   }
   Serial.println(" OK");
 
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("Waiting for NTP time");
   time_t now = 0;
   struct tm timeinfo = {0};
@@ -260,8 +260,6 @@ void setup(void) {
 
   // --- ИНИЦИАЛИЗАЦИЯ ИНТЕРФЕЙСА EEZ STUDIO ---
   ui_init();   // создаёт все экраны и загружает главный
-  setenv("TZ", "UTC-3", 1);
-  tzset();
   // --- ПОДКЛЮЧЕНИЕ К WI-FI И СИНХРОНИЗАЦИЯ ВРЕМЕНИ ---
   if (syncTime()) {
     // Первое обновление строки hms
