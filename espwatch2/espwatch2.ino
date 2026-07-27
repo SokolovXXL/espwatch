@@ -20,44 +20,119 @@ struct WifiCred {
 };
 
 // ---------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ WI-FI ----------
+static char hms_buf[9] = "00:00:00";
 bool wifi_scanning = false;
 bool wifi_connecting = false;
 uint32_t wifi_connect_start_ms = 0;
 String wifi_password = "";
-bool sdCardReady = false;                 // true, если SD-карта успешно инициализирована
+bool sdCardReady = false;
 static const char *WIFI_CREDS_FILE = "/wifi.txt";
+bool background_scan_active = false;
+uint32_t last_background_scan_ms = 0;
+const uint32_t BACKGROUND_SCAN_INTERVAL = 60000;
+static char selected_ssid[64];
+static std::vector<String> wifi_ssid_list;   // holds copies of SSIDs
+// ---------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ RTC (DS3231) ----------
+bool rtcReady = false;                // флаг наличия RTC
+uint8_t rtc_second, rtc_minute, rtc_hour, rtc_day, rtc_date, rtc_month, rtc_year; // текущее время
+
+// ---------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ДЛЯ АВТОВЫКЛЮЧЕНИЯ ПОДСВЕТКИ ----------
+uint32_t lastTouchTime = 0;      // время последнего касания (мс)
+bool backlightOn = true;         // состояние подсветки
+
 // Обработчик выбора сети из списка (объявлен ниже, в extern "C" блоке)
 extern "C" void wifi_network_selected(lv_event_t *e);
+
+// ------------------------------------------------------------------
+// Работа с RTC DS3231 напрямую по I2C (адрес 0x68)
+// ------------------------------------------------------------------
+
+static bool readDS3231() {
+    Wire.beginTransmission(0x68);
+    Wire.write(0x00);              // начать с регистра секунд
+    if (Wire.endTransmission() != 0) return false;
+    
+    Wire.requestFrom(0x68, 7);
+    if (Wire.available() < 7) return false;
+    
+    uint8_t sec = Wire.read();
+    uint8_t min = Wire.read();
+    uint8_t hour = Wire.read();
+    uint8_t dow = Wire.read();     // день недели (не используем)
+    uint8_t date = Wire.read();
+    uint8_t month = Wire.read();
+    uint8_t year = Wire.read();
+
+    // Преобразование BCD -> двоичное
+    rtc_second = (sec & 0x0F) + ((sec >> 4) * 10);
+    rtc_minute = (min & 0x0F) + ((min >> 4) * 10);
+    
+    // Часы (24‑часовой режим)
+    if (hour & 0x40) { // бит 6 = 1 – 12‑часовой режим (не поддерживаем)
+        // игнорируем или пересчитываем – для простоты считаем, что всегда 24‑часовой
+    }
+    rtc_hour = ((hour & 0x0F) + ((hour >> 4) * 10)) % 24;
+    
+    rtc_date = (date & 0x0F) + ((date >> 4) * 10);
+    rtc_month = (month & 0x0F) + ((month >> 4) * 10);
+    rtc_year = (year & 0x0F) + ((year >> 4) * 10);   // две последние цифры года
+    return true;
+}
+
+// Запись времени в RTC (вызывается после получения NTP)
+static void writeDS3231(int year, int month, int day, int hour, int minute, int second) {
+    // Устанавливаем время в формате BCD
+    Wire.beginTransmission(0x68);
+    Wire.write(0x00);   // регистр секунд
+    Wire.write(((second / 10) << 4) | (second % 10));
+    Wire.write(((minute / 10) << 4) | (minute % 10));
+    Wire.write(((hour / 10) << 4) | (hour % 10));
+    Wire.write(0x01);   // день недели (понедельник) – не критично
+    Wire.write(((day / 10) << 4) | (day % 10));
+    Wire.write(((month / 10) << 4) | (month % 10));
+    Wire.write(((year % 100) / 10 << 4) | (year % 10));
+    Wire.endTransmission();
+}
 
 // Функция обновления списка сетей в переменной WIFI_NETWORKS
 void update_wifi_networks_list() {
     int n = WiFi.scanComplete();
     if (n <= 0) {
         eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_NETWORKS,
-            eez::Value(0, VALUE_TYPE_NULL)); // пустой массив
+            eez::Value(0, VALUE_TYPE_NULL));
         eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-            eez::Value(n == 0 ? "No networks" : "Scan failed", VALUE_TYPE_STRING));
-        lv_obj_clean(objects.wifi_networks); // список тоже очищаем
+            eez::Value(n == 0 ? "No ntwrks" : "failed", VALUE_TYPE_STRING));
+        lv_obj_clean(objects.wifi_networks);
+        wifi_ssid_list.clear();   // also clear stored list
         return;
     }
-    // Создаём массив строк
+
+    // Store copies of all SSIDs
+    wifi_ssid_list.clear();
+    wifi_ssid_list.reserve(n);
+    for (int i = 0; i < n; i++) {
+        wifi_ssid_list.push_back(WiFi.SSID(i));   // copy into vector
+    }
+
+    // Create array of Value objects using pointers to the vector's strings
     auto arrayValue = eez::Value::makeArrayRef(n, defs_v3::ARRAY_TYPE_STRING, 0);
     auto array = arrayValue.getArray();
     for (int i = 0; i < n; i++) {
-        array->values[i] = eez::Value::makeStringRef(WiFi.SSID(i).c_str(), -1, 0);
+        array->values[i] = eez::Value::makeStringRef(wifi_ssid_list[i].c_str(), -1, 0);
     }
+
     eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_NETWORKS, arrayValue);
     eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-        eez::Value("Scan complete", VALUE_TYPE_STRING));
-    WiFi.scanDelete(); // очищаем результаты после использования
+        eez::Value("ready", VALUE_TYPE_STRING));
+    WiFi.scanDelete();
 
-    // Заполняем видимый виджет списка (lv_list) и вешаем клик-обработчик на каждую кнопку
     eez_update_wifi_networks_list(objects.wifi_networks, wifi_network_selected);
 }
 
 // ---------- ОБРАБОТЧИКИ СОБЫТИЙ (вызываются из UI) ----------
 extern "C" {
   void wifi_scan_clicked(lv_event_t *e) {
+      background_scan_active = false;
       if (WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING) {
           wifi_scanning = true;
           eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
@@ -75,25 +150,26 @@ extern "C" {
       const char *ssid = lv_list_get_btn_text(list, btn);
       if (!ssid) return;
 
+      strncpy(selected_ssid, ssid, sizeof(selected_ssid)-1);
+      selected_ssid[sizeof(selected_ssid)-1] = '\0';
       eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_SELECTED_SSID,
-          eez::Value::makeStringRef(ssid, -1, 0));
+          eez::Value::makeStringRef(selected_ssid, -1, 0));
 
-      lv_textarea_set_text(objects.obj2, ""); // очищаем поле пароля от предыдущего ввода
-
-      // Выезжает панель подключения поверх wifimenu (сетка X:0 Y:58, как задумано в screens.c)
+      lv_textarea_set_text(objects.obj2, "");
       lv_obj_set_pos(objects.wifi_connect, 0, 58);
   }
 
   void wifi_connect_clicked(lv_event_t *e) {
       // SSID берём из глобальной переменной (её выставил wifi_network_selected),
       // пароль читаем прямо из текстового поля панели подключения
+      background_scan_active = false;
       Value ssidVal = eez::flow::getGlobalVariable(FLOW_GLOBAL_VARIABLE_SELECTED_SSID);
       const char* ssid = ssidVal.getString();
       const char* pass = lv_textarea_get_text(objects.obj2);
 
       if (!ssid || strlen(ssid) == 0) {
           eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-              eez::Value("Select a network", VALUE_TYPE_STRING));
+              eez::Value("Slct ntwrk", VALUE_TYPE_STRING));
           return;
       }
 
@@ -105,7 +181,7 @@ extern "C" {
       wifi_connecting = true;
       wifi_connect_start_ms = ::millis();
       eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-          eez::Value("Connecting...", VALUE_TYPE_STRING));
+          eez::Value("Cnecting", VALUE_TYPE_STRING));
 
       // Прячем панель подключения обратно, статус будет виден в wifimenu (wifi_on_off)
       lv_obj_set_pos(objects.wifi_connect, -600, 58);
@@ -121,16 +197,18 @@ extern "C" {
       if (on) {
           WiFi.mode(WIFI_STA);
           eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-              eez::Value("Wi-Fi on", VALUE_TYPE_STRING));
+              eez::Value("on", VALUE_TYPE_STRING));
           // Можно автоматически запустить сканирование
           wifi_scan_clicked(e);
       } else {
+        background_scan_active = false;
+        last_background_scan_ms = ::millis();
           WiFi.disconnect(true);
           WiFi.mode(WIFI_OFF);
           wifi_connecting = false;
           wifi_scanning = false;
           eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-              eez::Value("Wi-Fi off", VALUE_TYPE_STRING));
+              eez::Value("off", VALUE_TYPE_STRING));
           // Очищаем список сетей
           eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_NETWORKS,
               eez::Value(0, VALUE_TYPE_NULL));
@@ -196,6 +274,12 @@ void my_touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     data->point.x = touch.coords[0].x;
     data->point.y = touch.coords[0].y;
     data->state   = LV_INDEV_STATE_PR;
+    // ---------- ОБНОВЛЯЕМ ВРЕМЯ ПОСЛЕДНЕГО КАСАНИЯ И ВКЛЮЧАЕМ ПОДСВЕТКУ ПРИ НАДОБНОСТИ ----------
+    lastTouchTime = ::millis();
+    if (!backlightOn) {
+        digitalWrite(GFX_BL, HIGH);
+        backlightOn = true;
+    }
   } else {
     data->state   = LV_INDEV_STATE_REL;
   }
@@ -292,47 +376,25 @@ void syncTime() {
     }
     if (timeinfo.tm_year >= (2020 - 1900)) {
         Serial.println(" OK");
-        char buf[9];
-        strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+        strftime(hms_buf, sizeof(hms_buf), "%H:%M:%S", &timeinfo);
         eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_HMS,
-        eez::Value::makeStringRef(buf, -1, 0x12345678));
+            eez::Value::makeStringRef(hms_buf, -1, 0x12345678));
+        // --- ОБНОВЛЯЕМ RTC из NTP ---
+        if (rtcReady) {
+            writeDS3231(
+                timeinfo.tm_year + 1900,
+                timeinfo.tm_mon + 1,
+                timeinfo.tm_mday,
+                timeinfo.tm_hour,
+                timeinfo.tm_min,
+                timeinfo.tm_sec
+            );
+            Serial.println("RTC updated from NTP.");
+        }
     } else {
         Serial.println(" FAILED");
     }
 }
-/*bool syncTime() {
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(" FAILED");
-    return false;
-  }
-  Serial.println(" OK");
-
-  configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Waiting for NTP time");
-  time_t now = 0;
-  struct tm timeinfo = {0};
-  int retry = 0;
-  while (timeinfo.tm_year < (2020 - 1900) && ++retry < 20) {
-    delay(1000);
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    Serial.print(".");
-  }
-  if (timeinfo.tm_year < (2020 - 1900)) {
-    Serial.println(" FAILED");
-    return false;
-  }
-  Serial.println(" OK");
-  return true;
-}*/
 
 // =================================================================
 // WI-FI CREDENTIALS STORAGE НА SD-КАРТЕ (/wifi.txt)
@@ -340,8 +402,6 @@ void syncTime() {
 //   SSID1;PASSWORD1
 //   SSID2;PASSWORD2
 // =================================================================
-
-
 
 // Читает и парсит /wifi.txt целиком в вектор структур WifiCred.
 // Корректно обрабатывает CRLF/LF, пустые строки и строки без ';'.
@@ -521,10 +581,13 @@ static bool tryConnectSavedNetworks() {
       Serial.println(WiFi.localIP());
 
       wifi_password = cred.pass;
+      strncpy(selected_ssid, cred.ssid.c_str(), sizeof(selected_ssid)-1);
+      selected_ssid[sizeof(selected_ssid)-1] = '\0';
       eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_SELECTED_SSID,
-          eez::Value(cred.ssid.c_str(), VALUE_TYPE_STRING));
+          eez::Value::makeStringRef(selected_ssid, -1, 0));
+
       eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-          eez::Value("Connected", VALUE_TYPE_STRING));
+          eez::Value("Cnected", VALUE_TYPE_STRING));
 
       connected = true;
       break;
@@ -557,12 +620,34 @@ void setup(void) {
   #ifdef GFX_BL
     pinMode(GFX_BL, OUTPUT);
     digitalWrite(GFX_BL, HIGH);
+    backlightOn = true;
+    lastTouchTime = ::millis();
   #endif
 
   Wire.begin(Touch_I2C_SDA, Touch_I2C_SCL);
   bsp_touch_init(&Wire, Touch_RST, Touch_INT,
                  gfx->getRotation(), gfx->width(), gfx->height());
 
+  // --- Инициализация RTC (DS3231) с повторными попытками ---
+  bool found = false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+      Wire.beginTransmission(0x68);
+      if (Wire.endTransmission() == 0) {
+          found = true;
+          break;
+      }
+      delay(50);
+  }
+  if (found) {
+      Serial.println("DS3231 found.");
+      rtcReady = true;
+      // Do NOT read or write RTC here; defer to after ui_init()
+  } else {
+      Serial.println("DS3231 not found.");
+      rtcReady = false;
+  }
+
+  // --- Остальная инициализация (LVGL, UI, SD, Wi-Fi) ---
   lv_init();
   lv_disp_draw_buf_init(&draw_buf, buf, NULL, sizeof(buf)/sizeof(lv_color_t));
   static lv_disp_drv_t disp_drv;
@@ -584,10 +669,29 @@ void setup(void) {
   timerAttachInterrupt(timer, &onTimer);
   timerAlarm(timer, 1, true, 0);
 
-  // --- !!! ИНИЦИАЛИЗАЦИЯ UI ДО ВСЕХ ОПЕРАЦИЙ С ГЛОБАЛЬНЫМИ ПЕРЕМЕННЫМИ !!! ---
   ui_init();
-
-  // --- Теперь можно инициализировать SD и работать с Wi-Fi ---
+  if (rtcReady) {
+      bool readOk = false;
+      for (int i = 0; i < 5; i++) {
+          if (readDS3231()) { readOk = true; break; }
+          delay(20);
+      }
+      if (readOk) {
+          if (rtc_year < 20) {
+              Serial.println("RTC year invalid, setting default (2026-01-01 00:00:00)");
+              writeDS3231(2026, 1, 1, 0, 0, 0);
+              readDS3231();  // re-read
+          }
+          sprintf(hms_buf, "%02d:%02d:%02d", rtc_hour, rtc_minute, rtc_second);
+          eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_HMS,
+              eez::Value::makeStringRef(hms_buf, -1, 0x12345678));
+          Serial.print("RTC initial time: "); Serial.println(hms_buf);
+      } else {
+          Serial.println("RTC read error after multiple attempts.");
+          rtcReady = false;
+      }
+  }
+  // --- SD и Wi-Fi ---
   if (!SD.begin(SD_CS_PIN, SPI)) {
       Serial.println("SD card initialization failed!");
       sdCardReady = false;
@@ -609,27 +713,24 @@ void setup(void) {
   }
 
   if (sdCardReady) {
-      // Создать файл, если отсутствует
       if (!SD.exists(WIFI_CREDS_FILE)) {
           File f = SD.open(WIFI_CREDS_FILE, FILE_WRITE);
           if (f) { f.flush(); f.close(); }
       }
-      // Попытка автоподключения (теперь после ui_init)
       if (tryConnectSavedNetworks()) {
           syncTime();
       } else {
-          // Статус можно устанавливать, т.к. ui уже инициализирован
           WiFi.mode(WIFI_STA);
           eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-              eez::Value("Not connected", VALUE_TYPE_STRING));
+              eez::Value("Nt cnected", VALUE_TYPE_STRING));
       }
   } else {
       Serial.println("Skipping auto Wi-Fi connect: SD card not available.");
       WiFi.mode(WIFI_STA);
       eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-          eez::Value("No SD card", VALUE_TYPE_STRING));
+          eez::Value("NoSD", VALUE_TYPE_STRING));
   }
-
+  last_background_scan_ms = ::millis();
   Serial.println("Setup done.");
 }
 
@@ -638,27 +739,48 @@ void setup(void) {
 // =================================================================
 void loop() {
     static uint32_t last_tick = 0;
+    static uint32_t last_second = 0;
     uint32_t now = lv_millis;
     if (now != last_tick) {
         lv_tick_inc(now - last_tick);
         last_tick = now;
     }
 
-    // Обновление времени каждую секунду
-    static uint32_t last_second = 0;
+    // Обновление времени каждую секунду (из RTC, если доступен)
     if (now - last_second >= 1000) {
       last_second = now;
-      time_t rawtime = time(nullptr);
-      struct tm* tm_info = localtime(&rawtime);
-      // Проверяем, что время действительно установлено (год > 2020)
-      if (tm_info->tm_year >= (2020 - 1900)) {
-        char buf[9];
-        strftime(buf, sizeof(buf), "%H:%M:%S", tm_info);
-        // Обновляем глобальную переменную EEZ
-        eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_HMS, eez::Value::makeStringRef(buf, -1, 0x12345678));
+      if (rtcReady) {
+        if (readDS3231()) {
+            sprintf(hms_buf, "%02d:%02d:%02d", rtc_hour, rtc_minute, rtc_second);
+            eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_HMS,
+                eez::Value::makeStringRef(hms_buf, -1, 0x12345678));
+        } else {
+            rtcReady = false;
+            Serial.println("RTC read failed, disabling RTC.");
+        }
+      } else {
+        // fallback to NTP time
+        time_t rawtime = time(nullptr);
+        struct tm* tm_info = localtime(&rawtime);
+        if (tm_info->tm_year >= (2020 - 1900)) {
+            strftime(hms_buf, sizeof(hms_buf), "%H:%M:%S", tm_info);
+            eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_HMS,
+                eez::Value::makeStringRef(hms_buf, -1, 0x12345678));
+        }
       }
     }
-
+    // --- ФОНОВОЕ СКАНИРОВАНИЕ (если Wi-Fi отключён) ---
+    if (sdCardReady && WiFi.status() != WL_CONNECTED && !wifi_scanning && !wifi_connecting && !background_scan_active) {
+        if (::millis() - last_background_scan_ms >= BACKGROUND_SCAN_INTERVAL) {
+            // Запускаем асинхронное сканирование
+            if (WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING) {
+                background_scan_active = true;
+                last_background_scan_ms = ::millis();
+                eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
+                    eez::Value("scning", VALUE_TYPE_STRING));
+            }
+        }
+    }
     // --- WI-FI СКАНИРОВАНИЕ ---
     if (wifi_scanning) {
         int scanResult = WiFi.scanComplete();
@@ -667,16 +789,54 @@ void loop() {
             wifi_scanning = false;
         }
     }
-
+    // --- ОБРАБОТКА ЗАВЕРШЕНИЯ ФОНОВОГО СКАНИРОВАНИЯ ---
+    if (background_scan_active) {
+        int scanResult = WiFi.scanComplete();
+        if (scanResult >= 0) {
+            background_scan_active = false;
+            // Загружаем сохранённые сети
+            std::vector<WifiCred> creds = wifiCreds_load();
+            String found_ssid, found_pass;
+            if (!creds.empty()) {
+                for (int i = 0; i < scanResult; i++) {
+                    String ssid = WiFi.SSID(i);
+                    for (const auto &c : creds) {
+                        if (c.ssid == ssid) {
+                            found_ssid = c.ssid;
+                            found_pass = c.pass;
+                            break;
+                        }
+                    }
+                    if (!found_ssid.isEmpty()) break;
+                }
+            }
+            WiFi.scanDelete(); // очищаем результаты
+            if (!found_ssid.isEmpty()) {
+                // Пытаемся подключиться
+                WiFi.disconnect(true);
+                wifi_password = found_pass;
+                WiFi.begin(found_ssid.c_str(), found_pass.c_str());
+                wifi_connecting = true;
+                wifi_connect_start_ms = ::millis();
+                eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
+                    eez::Value("cnectng", VALUE_TYPE_STRING));
+            } else {
+                eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
+                    eez::Value(creds.empty() ? "No svd" : "No svd", VALUE_TYPE_STRING));
+            }
+        }
+    }
     // --- WI-FI ПОДКЛЮЧЕНИЕ ---
     if (wifi_connecting) {
         if (WiFi.status() == WL_CONNECTED) {
             wifi_connecting = false;
             eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-                eez::Value("Connected", VALUE_TYPE_STRING));
+                eez::Value("Cnected", VALUE_TYPE_STRING));
             // Сохраняем имя сети в переменную SELECTED_SSID (если нужно)
+            strncpy(selected_ssid, WiFi.SSID().c_str(), sizeof(selected_ssid)-1);
+            selected_ssid[sizeof(selected_ssid)-1] = '\0';
             eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_SELECTED_SSID,
-                eez::Value(WiFi.SSID().c_str(), VALUE_TYPE_STRING));
+                eez::Value::makeStringRef(selected_ssid, -1, 0));
             // Сохраняем/обновляем учётные данные на SD (без дублей, с заменой пароля)
             if (sdCardReady) {
               wifiCreds_upsert(WiFi.SSID(), wifi_password);
@@ -687,12 +847,18 @@ void loop() {
         } else if (::millis() - wifi_connect_start_ms > 15000) { // таймаут 15 сек
             wifi_connecting = false;
             eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_WIFI_ON_OFF,
-                eez::Value("Connection timeout", VALUE_TYPE_STRING));
+                eez::Value("timeout", VALUE_TYPE_STRING));
         }
+    }
+
+    // ---------- АВТОВЫКЛЮЧЕНИЕ ПОДСВЕТКИ ПО ТАЙМАУТУ БЕЗДЕЙСТВИЯ ----------
+    if (backlightOn && (::millis() - lastTouchTime > 15000)) {
+        digitalWrite(GFX_BL, LOW);
+        backlightOn = false;
+        Serial.println("Backlight off (timeout)");
     }
 
     ui_tick();
     lv_timer_handler();
     delay(5);
 }
-
